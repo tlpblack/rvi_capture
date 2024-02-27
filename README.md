@@ -36,6 +36,7 @@ Tested on Arch Linux with iOS 14.8.
 - In Wireshark, you can filter for a particular network interface based on the
   `frame.interface_name` field. Here are some possible values (as tested on iOS 14.8):
   - `en0`: wifi interface
+  - `awdl0`: Apple Wireless Direct Link interface (used by AirDrop)
   - `pdp_ip0`: cellular interface
   - `ipsec1`: IPSec outer transport for VoLTE
   - `ipsec3`: IPSec inner transport for VoLTE
