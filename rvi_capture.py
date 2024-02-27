@@ -248,6 +248,42 @@ class PacketExtractor(object):
                       is_eth=is_eth,
                       pkt_payload=payload)
 
+class RAWPacketExtractor(object):
+    def __init__(self, udid=None):
+        idevice = IDevice(udid=udid)
+        port, ssl = LockdownService(idevice).start_service('com.apple.pcapd')
+        self.conn = IDeviceConnection(idevice, port)    # keep reference to keep fd open
+        ssl and self.conn.enable_ssl()
+
+    def __iter__(self):
+        conn = self.conn
+        ctp = self._chunk_to_packet
+        def read_fully(n):
+            b = bytearray()
+            l = 0
+            while l < n:
+                b += conn.recv(n - l)
+                l = len(b)
+            return b
+        while True:
+            try:
+                [chunk_len] = UB32.unpack(read_fully(4))
+            except (ValueError, struct.error):
+                raise EOFError
+            chunk = read_fully(chunk_len)
+            if len(chunk) != chunk_len:
+                raise EOFError
+            chunk = plistlib.loads(chunk)
+            if type(chunk) is not bytes:
+                raise TypeError('got non-data chunk')
+            #stderr_print("Yielding a chunk. len(ctp)={} chunk_len={}".format(len(ctp(chunk)), chunk_len ))
+            yield ctp(chunk)
+
+    def _chunk_to_packet(self, chunk):
+        if len(chunk) < HEADER_SIZE:
+            raise ValueError('chunk too small')
+        return chunk
+
 
 class PacketDumper(object):
     def __init__(self, pkt_iter, out_file):
@@ -287,6 +323,7 @@ class NGPacketDumper(PacketDumper):
                 if_idx,
                 pkt.epoch_usecs >> 32, pkt.epoch_usecs & 0xFFFFFFFF,
                 payload_len, payload_len)
+
             self._write_block(6, pcap_hdr + pkt.pkt_payload,
                               {2: UM32.pack(self.IN_OUT_TO_EPBFLAGS[pkt.in_out])})
 
@@ -327,6 +364,106 @@ class PCAPPacketDumper(PacketDumper):
                                              len(payload), len(payload))
             self.out_file.writelines((header, payload))
 
+class PKTAPPacketDumper(PacketDumper):
+    SECTION_BLOCK_STRUCT = struct.Struct('=IHHq')
+    INTERFACE_BLOCK_STRUCT = struct.Struct('=HHI')
+    PROCESS_BLOCK_STRUCT = struct.Struct('=I')
+    ENHANCED_PACKET_STRUCT = struct.Struct('=IIIII')
+    OPTION_HEADER_STRUCT = struct.Struct('=HH')
+    IN_OUT_TO_EPBFLAGS = {'I': 0b01, 'O': 0b10, 'U': 0b00}
+
+    def run(self, packet_cb=None):
+        # write section block
+        self._write_block(0x0A0D0D0A,
+                          self.SECTION_BLOCK_STRUCT.pack(0x1A2B3C4D, 1, 0, -1))
+        # process packets
+        if_name_to_idx = {}
+        next_if_idx = 0
+        
+        proctuple_to_idx = {}
+        next_proctuple_idx = 0
+
+        for pkt in self.pkt_iter:
+            packet_cb is not None and packet_cb(pkt)
+            if_name = pkt.iface_name
+            procname = pkt.proc[0]
+            procid = pkt.proc[1] if pkt.proc[1]>=0 else 0xffffffff
+            proctuple = (procid, procname)
+
+            eprocname = pkt.eproc[0]
+            eprocid = pkt.eproc[1] if pkt.eproc[1]>=0 else 0xffffffff
+            eproctuple = (eprocid, eprocname)
+
+            if_idx = if_name_to_idx.setdefault(if_name, next_if_idx)
+            proctuple_idx = proctuple_to_idx.setdefault(proctuple, next_proctuple_idx)
+            eproctuple_idx = proctuple_to_idx.setdefault(eproctuple, next_proctuple_idx)
+            if if_idx == next_if_idx:
+                # write interface block
+                self._write_block(1, self.INTERFACE_BLOCK_STRUCT.pack(
+                    1 if pkt.is_eth else 101, 0, 0xFFFFFFFF),
+                    {2: if_name.encode()}) # if_name
+                next_if_idx += 1
+
+            if proctuple_idx == next_proctuple_idx:
+                # write process block
+                self._write_block(0x80000001, self.PROCESS_BLOCK_STRUCT.pack(procid),
+                    {2: procname.encode()}) # procname
+                next_proctuple_idx += 1
+
+            if eproctuple_idx == next_proctuple_idx:
+                # write process block
+                self._write_block(0x80000001, self.PROCESS_BLOCK_STRUCT.pack(eprocid),
+                    {2: eprocname.encode()}) # eprocname
+                next_proctuple_idx += 1
+
+            # write packet block
+            payload_len = len(pkt.pkt_payload)
+            pcap_hdr = self.ENHANCED_PACKET_STRUCT.pack(
+                if_idx,
+                pkt.epoch_usecs >> 32, pkt.epoch_usecs & 0xFFFFFFFF,
+                payload_len, payload_len)
+
+            if (eproctuple_idx != proctuple_idx) and ( eprocid > 0 ):
+              self._write_block(6, pcap_hdr + pkt.pkt_payload,
+                                {
+                                  0x8001: UM32.pack(proctuple_idx),
+                                  0x8003: UM32.pack(eproctuple_idx),
+                                  0x0002: UM32.pack(self.IN_OUT_TO_EPBFLAGS[pkt.in_out])
+                                }
+                               )
+            else:
+              self._write_block(6, pcap_hdr + pkt.pkt_payload,
+                                {
+                                  0x8001: UM32.pack(proctuple_idx),
+                                  0x0002: UM32.pack(self.IN_OUT_TO_EPBFLAGS[pkt.in_out])
+                                }
+                               )
+ 
+    def _write_block(self, blk_type, blk_data, blk_options={}):
+        blks = [UM32.pack(blk_type), b'']
+        blks += (blk_data, b'\0' * (-len(blk_data) % 4))
+        for code, val in blk_options.items():
+            blks += (self.OPTION_HEADER_STRUCT.pack(code, len(val)), 
+                      val, 
+                      b'\0' * (-len(val) % 4)
+                    )
+        blks += (b'\0\0\0\0',) # end of options
+        total_len = sum(len(x) for x in blks) + 8
+        total_len_b = UM32.pack(total_len)
+        blks[1] = total_len_b
+        blks += (total_len_b,)
+        self.out_file.write(b''.join(blks))
+
+
+
+
+class RAWPacketDumper(PacketDumper):
+    def run(self, packet_cb=None):
+        for pkt in self.pkt_iter:
+            packet_cb is not None and packet_cb(pkt)
+            stderr_print("Got a packet. len(pkt)={}".format(len(pkt)))
+            self.out_file.write(pkt)
+
 
 stderr_print = functools.partial(print, file=sys.stderr)
 
@@ -342,7 +479,7 @@ def main():
     parser = argparse.ArgumentParser(description='Captures packets from iOS devices.',
                                      formatter_class=HelpFormatter)
     parser.add_argument('--format',
-                        choices=('pcap', 'pcapng'), default='pcapng',
+                        choices=('pcap', 'pcapng', 'pktap', 'raw'), default='pcapng',
                         help='capture format')
     parser.add_argument('--udid', help='device UDID (if more than 1 device)')
     parser.add_argument('outfile', help='output file (- for stdout)')
@@ -358,6 +495,8 @@ def main():
     dumper_class = {
         'pcap':   PCAPPacketDumper,
         'pcapng': NGPacketDumper,
+        'pktap': PKTAPPacketDumper,
+        'raw': RAWPacketDumper,
     }[args.format]
     # start capture
     stderr_print('capturing to {} ...'.format('<stdout>' if args.outfile == '-' else args.outfile))
@@ -367,9 +506,14 @@ def main():
         num_packets += 1
         stderr_print('\r{} packets captured.'.format(num_packets), end='', flush=True)
     try:
-        packet_extractor = PacketExtractor(udid=args.udid)
-        packet_dumper = dumper_class(packet_extractor, out_file)
-        packet_dumper.run(packet_callback)
+        if args.format != 'raw':
+          packet_extractor = PacketExtractor(udid=args.udid)
+          packet_dumper = dumper_class(packet_extractor, out_file)
+          packet_dumper.run(packet_callback)
+        else:
+          packet_extractor = RAWPacketExtractor(udid=args.udid)
+          packet_dumper = dumper_class(packet_extractor, out_file)
+          packet_dumper.run(packet_callback)
     except KeyboardInterrupt:
         stderr_print()
         stderr_print('closing capture ...')
